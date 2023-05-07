@@ -27,14 +27,35 @@ type FS struct {
 	mu sync.RWMutex
 	m  map[string]string    // lookup (path to hash path)
 	r  map[string][2]string // reverse lookup (hash path to path)
+
+	hl hashLocation
 }
 
-func NewFS(fsys fs.FS) *FS {
-	return &FS{
+type hashLocation int
+
+const (
+	hashLocationStart       hashLocation = iota //script.min.js -> a1b2c3...d4e5f6.script.min.js
+	hashLocationFirstPeriod                     //script.min.js -> script-a1b2c3...d4e5f6.min.js; original designed hash location
+	hashLocationEnd                             //script.min.js -> script.min.a1b2c3...d4e5f6.js
+
+	hashLocationDefault = hashLocationFirstPeriod
+)
+
+type optionFunc func(*FS)
+
+func NewFS(fsys fs.FS, options ...optionFunc) *FS {
+	f := &FS{
 		fsys: fsys,
 		m:    make(map[string]string),
 		r:    make(map[string][2]string),
+		hl:   hashLocationDefault,
 	}
+
+	for _, option := range options {
+		option(f)
+	}
+
+	return f
 }
 
 // Open returns a reference to the named file.
@@ -76,7 +97,7 @@ func (fsys *FS) HashName(name string) string {
 	// Compute hash and build filename.
 	hash := sha256.Sum256(buf)
 	hashhex := hex.EncodeToString(hash[:])
-	hashname := FormatName(name, hashhex)
+	hashname := FormatName(name, hashhex, fsys.hl)
 
 	// Store in lookups.
 	fsys.mu.Lock()
@@ -91,7 +112,7 @@ func (fsys *FS) HashName(name string) string {
 // extension. If no extension exists on filename then the hash is appended.
 // Returns blank string the original filename if hash is blank. Returns a blank
 // string if the filename is blank.
-func FormatName(filename, hash string) string {
+func FormatName(filename, hash string, hl hashLocation) string {
 	if filename == "" {
 		return ""
 	} else if hash == "" {
@@ -99,10 +120,27 @@ func FormatName(filename, hash string) string {
 	}
 
 	dir, base := path.Split(filename)
-	if i := strings.Index(base, "."); i != -1 {
-		return path.Join(dir, fmt.Sprintf("%s-%s%s", base[:i], hash, base[i:]))
+
+	switch hl {
+	case hashLocationFirstPeriod:
+		if i := strings.Index(base, "."); i != -1 {
+			return path.Join(dir, fmt.Sprintf("%s-%s%s", base[:i], hash, base[i:]))
+		}
+		return path.Join(dir, fmt.Sprintf("%s-%s", base, hash))
+
+	case hashLocationStart:
+		return path.Join(dir, fmt.Sprintf("%s.%s", hash, base))
+
+	case hashLocationEnd:
+		//Note, path.Ext() returns a value starting with a period (i.e.: .css),
+		//hence the %s%s
+		return path.Join(dir, fmt.Sprintf("%s.%s%s", base, hash, path.Ext(base)))
+
+	default:
+		//This should never occur since fsys.hashLocation is set by default and
+		//can only be set to one of our defined values.
+		return ""
 	}
-	return path.Join(dir, fmt.Sprintf("%s-%s", base, hash))
 }
 
 // ParseName splits formatted hash filename into its base & hash components.
@@ -211,5 +249,32 @@ func (h *fsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "HEAD" {
 			io.Copy(w, f)
 		}
+	}
+}
+
+// HashLocationStart sets the hash to be prepended to the start of the filename.
+// script.min.js becomes a1b2c3...d4e5f6.script.min.js.
+func HashLocationStart() optionFunc {
+	return func(f *FS) {
+		f.hl = hashLocationStart
+	}
+}
+
+// HashLocationEnd sets the hash to be appended to the end of the filename with
+// the extension copied after the hash.
+// script.min.js becomes script.min.a1b2c3...d4e5f6.js.
+func HashLocationEnd() optionFunc {
+	return func(f *FS) {
+		f.hl = hashLocationEnd
+	}
+}
+
+// HashLocationFirstPeriod sets the hash to be added in the middle of the filename,
+// specifically at the first period in the filename. This was the original designed
+// hash location.
+// script.min.js -> script-a1b2c3...d4e5f6.min.js
+func HashLocationFirstPeriod() optionFunc {
+	return func(f *FS) {
+		f.hl = hashLocationFirstPeriod
 	}
 }
