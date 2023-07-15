@@ -1,45 +1,46 @@
 /*
-Package hashfs provides a method for serving static files in a cache-busting and
-highly cache-able method. The contents of source files are hashed with the resulting
-computed hash added to the each file's filename with additional cache related info
-saved to HTTP headers.
+Package hashfs handles cache-busting of files by adding a hash of each file's
+contents to the filename.
 
-# How this works.
-
-  - Source files, from an fs.FS, are stored for serving.
-  - Your HTML code is updated to encapsulate static file URLs with a template
-    func to rewrite the URLs to use the hash filename ({{static ....}}).
-  - When you binary is run, templates.Parse... (or whatever you use) is called,
-    the hash for each static file is computed, each filename is rewritten to add
-    the hash, and your HTML is updated to use the new filename in the URL.
-  - When a static file at a URL is requested, the filename contains the hash. If
-    the browser has not already cached this file, the original filename is looked
-    up (there is a map between the hash filename and the original filename), and
-    the original file is served with aggressive caching headers.
+# How This Works:
+  - You provide your files, as an [fs.FS].
+  - When your binary runs, a hash is calculated of a static file's contents.
+  - The hash is appended to the file's name.
+  - The new filename is rewritten into your HTML code.
+  - When a browser requests a static file, using the filename-with-hash, the underlying
+    file is looked up and served with aggressive caching headers.
 
 # Usage:
+  - Call [hashfs.NewFS] before parsing your HTML templates.
+  - Define a func to call [HFS.GetHashPath], and add it to your [html/template.FuncMap].
+  - Modify your HTML templates to use the func defined in your [html/template.FuncMap]
+    for each static file you want to cache-bust.
+  - Call [hashfs.FileServer] in your HTTP router on the endpoint you serve static
+    files from.
 
-  - Call hashfs.New(...) in init() before parsing your HTML templates.
-  - Define a func to call hashfs.GetHashPath(), and add it to your funcMap (i.e.: templates.New("").Funcs(funcMap).ParseFS(...)).
-  - Rewrite your HTML to use the func defined in your func map in your HTML code (i.e.: {{static "/path/to/file.js"}}.
-  - Use hashfs.FileServer(...) in your HTTP Handler to serve static files.
+# Example:
+See the example/example.go file in the source repo.
 
 # Example FuncMap func:
 
-	  func static(originalPath) (hashPath string) {
+	  func static(originalPath string) (hashPath string) {
 		//Handle dev mode, serve non-hashed files.
 		if devMode {
 			return originalPath
 		}
 
 		//Trim path, if needed.
-		//For example, if your serve files at /static/... URLs and your fs.FS was "based"
-		//at a /static/ directory in your repo, then the fs.FS is "inside" the /static/
-		//directory and thus you don't need /static/ in the path to access each file. So
-		//therefore we have to strip the /static/ from the URL to match.
+		//
+		//For example, if your static files are served off of www.example.co/static/
+		//and your fs.FS lists files "inside" the /static/ directory from your source
+		//code repo, you need to remove the /static/ part of the URL to find the
+		//matching source file. The fs.FS files will not have /static/ in their paths
+		//since, the fs.FS just contains the files "inside" the /static/ directory.
 		trimmedPath := strings.TrimPrefix(originalPath, "/static/")
 
-		//Get the hashPath, calculating the hash if needed.
+		//Get the hashPath. This is where the hash is calculated, if it has not been
+		//already (this static func was already called on this originalPath when
+		//another template was being built in this run of your binary).
 		hashPath := yourHashFS.GetHashPath(trimmedPath)
 
 		//Now, we need to add the /static/ back to the path since that is how the
@@ -48,7 +49,6 @@ saved to HTTP headers.
 	  }
 
 # Definitions:
-
   - original path: the path to the on-disk source file.
   - hash path: the path where the filename includes the hash of the file's contents.
   - original name: the filename of the on-disk source file.
@@ -72,12 +72,14 @@ import (
 // Ensure file system implements interface.
 var _ fs.FS = (*HFS)(nil)
 
-// HFS represents an fs.FS with additional lookup tables for storing the hashes of
-// each file's contents.
+// HFS represents an fs.FS with additional lookup tables for storing the calculated
+// hashes of each file's contents. The hashes are used for aggressive client-side
+// caching and cache-busting.
 type HFS struct {
 	fsys fs.FS
 
 	//Lookup tables.
+	//Note that the lookup tables store a path to each file, not just a filename.
 	mu                     sync.RWMutex
 	originalPathToHashPath map[string]string  //a cache so we don't have to recalculate hash over and over.
 	hashPathReverse        map[string]reverse //get original path and hash from hash path.
@@ -92,7 +94,11 @@ type HFS struct {
 // file from the hash path when the file is requested.
 //
 // I.e.: when the browser requests a file via the hash path, we need a way to look
-// up the actual file's contents to serve.
+// up the actual file's contents to serve. This is used to get the originalPath from
+// the hashPath which is then used to look up the file in the fs.FS.
+//
+// The hash is used to set the Etag header. This way we don't have to "rip out" the
+// hash from the hashPath.
 type reverse struct {
 	originalPath string
 	hash         string
@@ -106,8 +112,8 @@ const (
 	hashLocationFirstPeriod                     //script.min.js -> script-a1b2c3...d4e5f6.min.js; original designed hash location
 	hashLocationEnd                             //script.min.js -> script.min.a1b2c3...d4e5f6.js
 
-	//default is "end" since this looks the best in browser dev tools. "first period"
-	//was the legacy only supported location.
+	//default is "end" since this looks the best in browser dev tools.
+	//"first period" was the legacy location.
 	hashLocationDefault = hashLocationEnd
 )
 
@@ -130,8 +136,7 @@ type optionFunc func(*HFS)
 //
 
 // HashLocationStart sets the hash to be prepended to the beginning of the filename.
-//
-// script.min.js becomes a1b2c3...d4e5f6.script.min.js.
+// script.min.js becomes a1b2c3...d4e5f6-script.min.js.
 //
 // This is nice to keep the filename all together, but is a bit ugly for debugging
 // in browser devtools since the on small/narrow screens the hash can take up all
@@ -144,9 +149,8 @@ func HashLocationStart() optionFunc {
 }
 
 // HashLocationEnd sets the hash to be appended to the end of the filename with the
-// extension copied after the hash.
-//
-// script.min.js becomes script.min.a1b2c3...d4e5f6.js.
+// extension copied after the hash. script.min.js becomes script.min.js-a1b2c3...d4e5f6.js.
+// This is the default hash location.
 //
 // This is nice to keep the filename all together; there really is no downside to this
 // location.
@@ -158,9 +162,7 @@ func HashLocationEnd() optionFunc {
 
 // HashLocationFirstPeriod sets the hash to be added in the middle of the filename,
 // specifically at the first period in the filename. This was the original designed
-// hash location.
-//
-// script.min.js -> script-a1b2c3...d4e5f6.min.js
+// hash location. script.min.js becomes script-a1b2c3...d4e5f6.min.js
 //
 // There is really no benefit to this location, and it is a bit ugly since it breaks
 // up the filename.
@@ -196,8 +198,8 @@ func NewFS(fsys fs.FS, options ...optionFunc) *HFS {
 // original path or a hash path. If a hash path is given, the original path will be
 // looked up to return the file with.
 //
-// This func is necessary and defined to fulfill the requirements of HFS to implement
-// fs.FS. It would be extremely odd to need to call this func directly.
+// This func is necessary for HFS to implement fs.FS. You should not need need to
+// call this func directly.
 func (hfs *HFS) Open(path string) (f fs.File, err error) {
 	f, _, err = hfs.open(path)
 	return
@@ -211,10 +213,10 @@ func (hfs *HFS) Open(path string) (f fs.File, err error) {
 // returned. The hash is used to set the Etag header.
 func (hfs *HFS) open(path string) (f fs.File, hash string, err error) {
 	//Try looking up the path in our table of hash paths. If the path is found, this
-	//means the path is a hash path. The returned original path can be used to look
-	//up the underlying source file.
+	//means the given path is a hash path. The returned original path can be used to
+	//look up the underlying source file.
 	//
-	//If the path is not found, then most likely the path is an original path. Just
+	//If the path is not found, than most likely the path is an original path. Just
 	//use it as-is to look up the source file.
 	hfs.mu.RLock()
 	reverse, exists := hfs.hashPathReverse[path]
@@ -222,22 +224,19 @@ func (hfs *HFS) open(path string) (f fs.File, hash string, err error) {
 		hash = reverse.hash
 		path = reverse.originalPath
 	}
-	hfs.mu.Unlock()
+	hfs.mu.RUnlock()
 
 	f, err = hfs.fsys.Open(path)
 	return
 }
-
-//
-//###################################################################################
-//
 
 // GetHashPath returns the hashPath for a provided originalPath. This will calculate
 // the hash for the file located at the originalPath if the hash has not already been
 // calculated.
 //
 // The hash is calculated once and stored in the lookup tables for reuse. This removes
-// the need to recalculate the hash each time GetHashPath is called.
+// the need to recalculate the hash each time GetHashPath is called for the same
+// originalPath.
 func (hfs *HFS) GetHashPath(originalPath string) (hashPath string) {
 	//Check if hashPath has already been created and is cached.
 	hfs.mu.RLock()
@@ -249,12 +248,12 @@ func (hfs *HFS) GetHashPath(originalPath string) (hashPath string) {
 	hfs.mu.RUnlock()
 
 	//Hash has not already been calculated, look up file and calculate hash.
+	//
+	//On error, just return the original filename this way the file can still
+	//be served.
+	//TODO: somehow notify of this error? log = ugly. panic = ugly. return err?
 	fileContents, err := fs.ReadFile(hfs.fsys, originalPath)
 	if err != nil {
-		//Just return the original filename upon an error. This way the file will
-		//still be served successfully.
-		//
-		//TODO: somehow notify of this error? log = ugly. panic = ugly. return err?
 		return originalPath
 	}
 
@@ -272,7 +271,7 @@ func (hfs *HFS) GetHashPath(originalPath string) (hashPath string) {
 	//Store mappings for reuse in the future.
 	hfs.mu.Lock()
 	hfs.originalPathToHashPath[originalPath] = hashPath
-	hfs.hashPathReverse[fileNameWithHash] = reverse{originalPath, hash}
+	hfs.hashPathReverse[hashPath] = reverse{originalPath, hash}
 	hfs.mu.Unlock()
 
 	return
@@ -289,11 +288,11 @@ func (hfs *HFS) calculateHash(fileContents []byte) (hash string) {
 	return
 }
 
-// addHashToFilename adds the hash to the filename at the location specified by
+// addHashToFilename adds the hash to the originalName at the location specified by
 // hashLocation. If originalName or hash is blank, the returned hashName will also
 // be blank.
 func (hfs *HFS) addHashToFilname(originalName, hash string) (hashName string) {
-	//Quick validation.
+	//Quick validation. Neither of these should ever be blank.
 	if originalName == "" {
 		return
 	}
@@ -346,7 +345,7 @@ func (hfs *HFS) addHashToFilname(originalName, hash string) (hashName string) {
 //###################################################################################
 //
 
-// hfsHandler is used to define a ServeHTTP func that uses our encapsulated fs.FS.
+// hfsHandler is used to define a ServeHTTP func that uses our customized fs.FS.
 type hfsHandler struct {
 	hfs *HFS
 }
@@ -354,9 +353,7 @@ type hfsHandler struct {
 // FileServer returns an http.Handler for serving files from our custom FS. It
 // provides a simplified implementation of http.FileServer which is used to
 // aggressivley cache files on the client. You would use this in the same manner as
-// http.FileServer.
-//
-// Ex.: http.FileServer(http.FS(someStaticFS)) -> hashfs.FileServer(hfs).
+// http.FileServer. Ex.: http.FileServer(http.FS(someStaticFS)) -> hashfs.FileServer(hfs).
 //
 // Because FileServer is focused on small known path files, several features
 // of http.FileServer have been removed including canonicalizing directories,
@@ -373,12 +370,11 @@ func FileServer(fsys fs.FS) http.Handler {
 
 // ServeHTTP serves files from our custom FS.
 //
-// This func is necessary and defined to fulfill the requirements of hfsHandler to
-// be used as an http.Handler. It would be extremely odd to need to call this func
-// directly.
+// This func is necessary to fulfill the requirements of hfsHandler to be used as
+// an http.Handler. It would be extremely odd to need to call this func directly.
 func (hh *hfsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	//Get path of file being requested. This should match a hash path, but could be
-	//an original path if a hash was never computed for the file.
+	//an original path if a hash was never calculated for the file.
 	filePath := r.URL.Path
 
 	// Clean up filePath based on URL path.
@@ -435,10 +431,8 @@ func (hh *hfsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	//versus weak Etag values.
 	//https://developers.cloudflare.com/cache/reference/etag-headers/#strong-etags
 	if hash != "" {
-		maxAge := strconv.Itoa(365 * 24 * 60 * 60)
-
-		w.Header().Set("Cache-Control", `public, max-age="`+maxAge+`", immutable`)
-		w.Header().Set("ETag", `"`+hash+`"`)
+		w.Header().Set("Cache-Control", hh.hfs.getCacheControl())
+		w.Header().Set("ETag", hash)
 
 		//We don't set a Last-Modified header since the file info available for
 		//files in an fs.FS does not include when the file was modified. Instead,
@@ -460,3 +454,29 @@ func (hh *hfsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 }
+
+// getCacheControl creates the value stored in the Cache-Control header. This was
+// separated out into a function for better testing and future ability to customize
+// the max-age via an optionFunc.
+func (hfs *HFS) getCacheControl() string {
+	maxAge := strconv.Itoa(365 * 24 * 60 * 60)
+
+	return `public, max-age="` + maxAge + "`, immutable"
+}
+
+//printEmbeddedFileList used as development tool only.
+// func (hfs *HFS) printEmbeddedFileList() (output []string) {
+// 	//the directory "." means the root directory of the embedded file.
+// 	const startingDirectory = "."
+
+// 	err := fs.WalkDir(hfs.fsys, startingDirectory, func(path string, d fs.DirEntry, err error) error {
+// 		output = append(output, path)
+// 		return nil
+// 	})
+// 	if err != nil {
+// 		output = []string{"error walking embedded directory", err.Error()}
+// 		return
+// 	}
+
+// 	return
+// }
