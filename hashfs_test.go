@@ -1,16 +1,21 @@
 package hashfs
 
 import (
+	"crypto"
 	"embed"
+	"io"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
+	"time"
 )
 
 //go:embed testdata
 var fsys embed.FS
 
-// Hashes for testdata files.
+// Hashes for testdata files, sha256.
 const (
 	scriptjs     = "e959523c7cd6350c847a50ba64d1876900e1ee9dcf3b6c4abb8a6b8e6c13b262"
 	stylesmincss = "c36dd06b311aa3f26ebe91cae8607a18b4a4de23f6d1c0c40943afbf07b8278d"
@@ -130,7 +135,7 @@ func TestGetHashPath(t *testing.T) {
 			return
 		}
 		if hashPath != expectedPath {
-			t.Fatal("hash not ad∏ded to filename correctly", hashPath)
+			t.Fatal("hash not added to filename correctly", hashPath)
 		}
 
 		//Retrieve the same hash name again to check we can get it from the
@@ -257,15 +262,26 @@ func TestFileServer(t *testing.T) {
 			return
 		}
 
-		got := make([]byte, res.ContentLength)
+		gotb := make([]byte, res.ContentLength)
 		want := "testdata"
-		_, err := res.Body.Read(got)
+		_, err := res.Body.Read(gotb)
 		if err != nil {
 			t.Fatal(err)
 			return
 		}
-		if string(got) != want {
-			t.Fatalf("bad content; \ngot:  %s, \nwant: %s", string(got), want)
+		if string(gotb) != want {
+			t.Fatalf("bad content; \ngot:  %s, \nwant: %s", string(gotb), want)
+			return
+		}
+
+		got, _ := strconv.Atoi(res.Header.Get("Content-Length"))
+		wanti := len(want)
+		if got != wanti {
+			t.Fatalf("bad length; \ngot:  %d, \nwant: %d", got, wanti)
+			return
+		}
+		if got != int(res.ContentLength) {
+			t.Fatalf("bad length; \ngot:  %d, \nwant: %d", got, res.ContentLength)
 			return
 		}
 	})
@@ -350,12 +366,140 @@ func TestFileServer(t *testing.T) {
 			return
 		}
 	})
+
+	t.Run("NewFS", func(t *testing.T) {
+		r := httptest.NewRequest("GET", "/"+originalPath, nil)
+		w := httptest.NewRecorder()
+		s := FileServer(fsys)
+		s.ServeHTTP(w, r)
+
+		res := w.Result()
+		if res.StatusCode != http.StatusOK {
+			t.Fatal("bad code", res.StatusCode)
+			return
+		}
+	})
+
+	t.Run("CheckHEAD", func(t *testing.T) {
+		r := httptest.NewRequest("HEAD", "/"+originalPath, nil)
+		w := httptest.NewRecorder()
+		s := FileServer(hfs)
+		s.ServeHTTP(w, r)
+
+		res := w.Result()
+		if res.StatusCode != http.StatusOK {
+			t.Fatal("bad code", res.StatusCode)
+			return
+		}
+
+		gotb := make([]byte, res.ContentLength)
+		_, err := res.Body.Read(gotb)
+		if err != io.EOF {
+			t.Fatal(err)
+			return
+		}
+	})
 }
 
-// func TestPrint(t *testing.T) {
-// 	hfs := NewFS(fsys, HashLocationStart())
+func TestCalculateHash(t *testing.T) {
+	t.Run("BadAlgo", func(t *testing.T) {
+		defer func() {
+			if r := recover(); r == nil {
+				t.Fatal("panic should have occured for bad hash algo given")
+			}
+		}()
 
-// 	z := hfs.PrintEmbeddedFileList()
-// 	t.Log("Lines:", z, len(z))
-// 	t.Fail()
-// }
+		_ = NewFS(fsys, HashAlgo(crypto.SHA1))
+	})
+
+	t.Run("SHA256", func(t *testing.T) {
+		hfs := NewFS(fsys)
+		fileContents, err := fs.ReadFile(hfs.fsys, "testdata/subdir1/script.js")
+		if err != nil {
+			t.Fatal(err)
+			return
+		}
+
+		got := hfs.calculateHash(fileContents)
+		want := scriptjs
+		if got != want {
+			t.Fatalf("bad content; \ngot:  %s, \nwant: %s", string(got), want)
+			return
+		}
+	})
+
+	t.Run("MD5", func(t *testing.T) {
+		scriptjsMD5 := "26e8d9f41310cf9173503f4f252c6626"
+
+		hfs := NewFS(fsys, HashAlgo(crypto.MD5))
+		fileContents, err := fs.ReadFile(hfs.fsys, "testdata/subdir1/script.js")
+		if err != nil {
+			t.Fatal(err)
+			return
+		}
+
+		got := hfs.calculateHash(fileContents)
+		want := scriptjsMD5
+		if got != want {
+			t.Fatalf("bad content; \ngot:  %s, \nwant: %s", string(got), want)
+			return
+		}
+	})
+}
+
+func TestMaxAge(t *testing.T) {
+	t.Run("Default", func(t *testing.T) {
+		hfs := NewFS(fsys)
+
+		if hfs.maxAge != time.Duration(365*24*60*60*time.Second) {
+			t.Fatal("max age not set to default")
+			return
+		}
+	})
+
+	t.Run("GoodValue", func(t *testing.T) {
+		ma := time.Duration(7 * 24 * 60 * 60 * time.Second)
+		hfs := NewFS(fsys, MaxAge(ma))
+
+		if hfs.maxAge != ma {
+			t.Fatal("max age not set to default")
+			return
+		}
+	})
+
+	t.Run("BadValueUseDefault", func(t *testing.T) {
+		ma := time.Duration(-7 * 24 * 60 * 60 * time.Second)
+		hfs := NewFS(fsys, MaxAge(ma))
+
+		if hfs.maxAge != time.Duration(365*24*60*60*time.Second) {
+			t.Fatal("max age not set to default because of bad given value")
+			return
+		}
+	})
+
+	t.Run("TestCustomMaxAgeFully", func(t *testing.T) {
+		ma := time.Duration(7 * 24 * 60 * 60 * time.Second)
+		hfs := NewFS(fsys, MaxAge(ma))
+
+		originalPath := "testdata/sub.dir.2/text.txt"
+		hashPath := hfs.GetHashPath(originalPath)
+
+		r := httptest.NewRequest("GET", "/"+hashPath, nil)
+		w := httptest.NewRecorder()
+		s := FileServer(hfs)
+		s.ServeHTTP(w, r)
+
+		res := w.Result()
+		if res.StatusCode != http.StatusOK {
+			t.Fatal("bad code", res.StatusCode)
+			return
+		}
+
+		got := res.Header.Get("Cache-Control")
+		want := hfs.getCacheControl()
+		if got != want {
+			t.Fatalf("bad cache-control; \ngot:  %s, \nwant: %s", string(got), want)
+			return
+		}
+	})
+}

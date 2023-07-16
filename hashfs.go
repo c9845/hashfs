@@ -57,6 +57,8 @@ See the example/example.go file in the source repo.
 package hashfs
 
 import (
+	"crypto"
+	"crypto/md5"
 	"crypto/sha256"
 	"encoding/hex"
 	"io"
@@ -67,6 +69,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Ensure file system implements interface.
@@ -85,8 +88,9 @@ type HFS struct {
 	hashPathReverse        map[string]reverse //get original path and hash from hash path.
 
 	//Options.
-	//TODO: add options for hash function (MD5 like S3?); Cache-Control header mx-age,...
 	hashLocation hashLocation
+	hashAlgo     crypto.Hash
+	maxAge       time.Duration
 }
 
 // reverse stores the original name and the calculated hash for a file for use in
@@ -143,8 +147,8 @@ type optionFunc func(*HFS)
 // of the room where a filename will be displayed making identifying a specific file
 // difficult.
 func HashLocationStart() optionFunc {
-	return func(f *HFS) {
-		f.hashLocation = hashLocationStart
+	return func(hfs *HFS) {
+		hfs.hashLocation = hashLocationStart
 	}
 }
 
@@ -155,8 +159,8 @@ func HashLocationStart() optionFunc {
 // This is nice to keep the filename all together; there really is no downside to this
 // location.
 func HashLocationEnd() optionFunc {
-	return func(f *HFS) {
-		f.hashLocation = hashLocationEnd
+	return func(hfs *HFS) {
+		hfs.hashLocation = hashLocationEnd
 	}
 }
 
@@ -167,8 +171,42 @@ func HashLocationEnd() optionFunc {
 // There is really no benefit to this location, and it is a bit ugly since it breaks
 // up the filename.
 func HashLocationFirstPeriod() optionFunc {
-	return func(f *HFS) {
-		f.hashLocation = hashLocationFirstPeriod
+	return func(hfs *HFS) {
+		hfs.hashLocation = hashLocationFirstPeriod
+	}
+}
+
+// HashAlgo specifies the algorithm to use to calculate the hash of each file's
+// contents. SHA256 is the default. MD5 is what S3 uses. This will panic if an
+// unsupported algorithm is provided.
+//
+// This should rarely be needed, since typically you don't really care about the hash
+// algorithm. This is provided mostly for people who like looking at shorter MD5 sums.
+func HashAlgo(algo crypto.Hash) optionFunc {
+	return func(hfs *HFS) {
+		hfs.hashAlgo = algo
+
+		//Make sure given algorithm is one of our supported algorithms.
+		result := hfs.calculateHash([]byte("hello world"))
+		if result == "" {
+			panic("unsupported hash algorithm used")
+		}
+	}
+}
+
+// MaxAge specifies the max-age value you want to set for the Cache-Control header.
+// Default is 1 year. If an invalid value is given, the default is used.
+//
+// This should rarely be needed, since typically you want to cache files for a really
+// long time. This is provided mostly for development and testing.
+func MaxAge(d time.Duration) optionFunc {
+	return func(hfs *HFS) {
+		//Don't set this field if it is a negative value. Default will be used instead.
+		if d < 0 {
+			return
+		}
+
+		hfs.maxAge = d
 	}
 }
 
@@ -184,6 +222,8 @@ func NewFS(fsys fs.FS, options ...optionFunc) *HFS {
 		originalPathToHashPath: make(map[string]string),
 		hashPathReverse:        make(map[string]reverse),
 		hashLocation:           hashLocationDefault,
+		hashAlgo:               crypto.SHA256,
+		maxAge:                 time.Duration(365 * 24 * 60 * 60 * time.Second),
 	}
 
 	//Apply any options.
@@ -278,13 +318,26 @@ func (hfs *HFS) GetHashPath(originalPath string) (hashPath string) {
 }
 
 // calculateHash calculates the hash of a file's contents and returns it with hex
-// encoding.
-//
-// This functionality was separated out of GetHashPath in case we add support for
-// alternative hash algorithms in the future (i.e.: MD5 like S3 uses for Etag header).
-func (hfs *HFS) calculateHash(fileContents []byte) (hash string) {
-	h := sha256.Sum256(fileContents)
-	hash = hex.EncodeToString(h[:])
+// encoding. If a non-supported hash algorithm is set, the resulting encodedHash will
+// be blank (""), however, this should have already been cause in the HashAlgo option
+// func when NewFS was called.
+func (hfs *HFS) calculateHash(fileContents []byte) (encodedHash string) {
+	var hash []byte
+
+	switch hfs.hashAlgo {
+	case crypto.SHA256:
+		h := sha256.Sum256(fileContents)
+		hash = []byte(h[:])
+	case crypto.MD5:
+		h := md5.Sum(fileContents)
+		hash = []byte(h[:])
+	default:
+		//This should never occur since we check if the hash algorithm is supported
+		//when NewFS is called. This is here mostly for tests.
+		hash = []byte("")
+	}
+
+	encodedHash = hex.EncodeToString(hash[:])
 	return
 }
 
@@ -341,10 +394,6 @@ func (hfs *HFS) addHashToFilname(originalName, hash string) (hashName string) {
 	}
 }
 
-//
-//###################################################################################
-//
-
 // hfsHandler is used to define a ServeHTTP func that uses our customized fs.FS.
 type hfsHandler struct {
 	hfs *HFS
@@ -362,7 +411,7 @@ func FileServer(fsys fs.FS) http.Handler {
 	//Check if the fsys is actually our custom HFS that encapsulates an fs.FS.
 	hfs, ok := fsys.(*HFS)
 	if !ok {
-		panic("unknown FS")
+		hfs = NewFS(fsys)
 	}
 
 	return &hfsHandler{hfs}
@@ -371,7 +420,7 @@ func FileServer(fsys fs.FS) http.Handler {
 // ServeHTTP serves files from our custom FS.
 //
 // This func is necessary to fulfill the requirements of hfsHandler to be used as
-// an http.Handler. It would be extremely odd to need to call this func directly.
+// an http.Handler.
 func (hh *hfsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	//Get path of file being requested. This should match a hash path, but could be
 	//an original path if a hash was never calculated for the file.
@@ -393,13 +442,12 @@ func (hh *hfsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	f, hash, err := hh.hfs.open(filePath)
 	if os.IsNotExist(err) {
 		//Handle if no file exists at the given path.
-		httpErrorCode := http.StatusNotFound
-		http.Error(w, http.StatusText(httpErrorCode), httpErrorCode)
+		http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 		return
 	} else if err != nil {
 		//Handle if some other error occured.
-		httpErrorCode := http.StatusInternalServerError
-		http.Error(w, http.StatusText(httpErrorCode), httpErrorCode)
+		//TODO: not sure how to test this. How do we get Open to return an error?
+		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 		return
 	}
 	defer f.Close()
@@ -410,12 +458,11 @@ func (hh *hfsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	//other strange error occured with the file.
 	info, err := f.Stat()
 	if err != nil {
-		httpErrorCode := http.StatusInternalServerError
-		http.Error(w, http.StatusText(httpErrorCode), httpErrorCode)
+		//TODO: not sure how to test this. How do we get Stat to return an error?
+		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 		return
 	} else if info.IsDir() {
-		httpErrorCode := http.StatusForbidden
-		http.Error(w, http.StatusText(httpErrorCode), httpErrorCode)
+		http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
 		return
 	}
 
@@ -444,11 +491,11 @@ func (hh *hfsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case io.ReadSeeker:
 		http.ServeContent(w, r, filePath, info.ModTime(), f)
 	default:
-		// Set content length.
+		//Only write out file's data on non-HEAD requests.
+		//TODO: not sure how to test this "default" case.
+		w.WriteHeader(http.StatusOK)
 		w.Header().Set("Content-Length", strconv.FormatInt(info.Size(), 10))
 
-		// Flush header and write content.
-		w.WriteHeader(http.StatusOK)
 		if r.Method != "HEAD" {
 			io.Copy(w, f)
 		}
@@ -459,8 +506,7 @@ func (hh *hfsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // separated out into a function for better testing and future ability to customize
 // the max-age via an optionFunc.
 func (hfs *HFS) getCacheControl() string {
-	maxAge := strconv.Itoa(365 * 24 * 60 * 60)
-
+	maxAge := strconv.Itoa(int(hfs.maxAge.Seconds()))
 	return `public, max-age="` + maxAge + "`, immutable"
 }
 
