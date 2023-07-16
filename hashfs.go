@@ -24,7 +24,9 @@ See the example/example.go file in the source repo.
 # Example FuncMap func:
 
 	  func static(originalPath string) (hashPath string) {
-		//Handle dev mode, serve non-hashed files.
+		//If in development mode, just return path as-is. We will serve a non-cache-
+		//busted version of the file since during development we refresh the browser
+		//a lot and don't want to cache things mistakenly.
 		if devMode {
 			return originalPath
 		}
@@ -124,6 +126,30 @@ const (
 // optionFunc used to modify the way the an HFS works.
 type optionFunc func(*HFS)
 
+// NewFS returns the provided fs.FS with additional tooling to support calculating the
+// hash of each file's contents for caching purposes.
+//
+// optionFuncs are used for modifying the HFS. Optional funcs were used, versus just
+// additional arguments, since this allows for future expansion without breaking
+// existing uses and is cleaner than empty unused arguments.
+func NewFS(fsys fs.FS, options ...optionFunc) *HFS {
+	f := &HFS{
+		fsys:                   fsys,
+		originalPathToHashPath: make(map[string]string),
+		hashPathReverse:        make(map[string]reverse),
+		hashLocation:           hashLocationDefault,
+		hashAlgo:               crypto.SHA256,
+		maxAge:                 time.Duration(365 * 24 * 60 * 60 * time.Second),
+	}
+
+	//Apply any options.
+	for _, option := range options {
+		option(f)
+	}
+
+	return f
+}
+
 //
 // There are a few ways to provide the hash location to the NewFS() func. Using a
 // func-per-location seems like the cleanest.
@@ -210,30 +236,6 @@ func MaxAge(d time.Duration) optionFunc {
 	}
 }
 
-// NewFS returns the provided fs.FS with additional tooling to support calculating the
-// hash of each file's contents for caching purposes.
-//
-// optionFuncs are used for modifying the HFS. Optional funcs were used, versus just
-// additional arguments, since this allows for future expansion without breaking
-// existing uses and is cleaner than empty unused arguments.
-func NewFS(fsys fs.FS, options ...optionFunc) *HFS {
-	f := &HFS{
-		fsys:                   fsys,
-		originalPathToHashPath: make(map[string]string),
-		hashPathReverse:        make(map[string]reverse),
-		hashLocation:           hashLocationDefault,
-		hashAlgo:               crypto.SHA256,
-		maxAge:                 time.Duration(365 * 24 * 60 * 60 * time.Second),
-	}
-
-	//Apply any options.
-	for _, option := range options {
-		option(f)
-	}
-
-	return f
-}
-
 // Open returns a reference to the file at the provided path. The path could be an
 // original path or a hash path. If a hash path is given, the original path will be
 // looked up to return the file with.
@@ -259,24 +261,23 @@ func (hfs *HFS) open(path string) (f fs.File, hash string, err error) {
 	//If the path is not found, than most likely the path is an original path. Just
 	//use it as-is to look up the source file.
 	hfs.mu.RLock()
+	defer hfs.mu.RUnlock()
 	reverse, exists := hfs.hashPathReverse[path]
 	if exists {
 		hash = reverse.hash
 		path = reverse.originalPath
 	}
-	hfs.mu.RUnlock()
 
 	f, err = hfs.fsys.Open(path)
 	return
 }
 
-// GetHashPath returns the hashPath for a provided originalPath. This will calculate
-// the hash for the file located at the originalPath if the hash has not already been
-// calculated.
-//
-// The hash is calculated once and stored in the lookup tables for reuse. This removes
-// the need to recalculate the hash each time GetHashPath is called for the same
-// originalPath.
+// GetHashPath returns the hashPath for a provided originalPath. The hashPath is the
+// originalPath with a hash of the file's contents added to the filename. The hash
+// of the contents of the file located at the originalPath will be calculated if it
+// has not already been done so. The hash will be saved to for future reuse and to
+// prevent unnecessary recalculation of the hash each time the same originalPath is
+// requested.
 func (hfs *HFS) GetHashPath(originalPath string) (hashPath string) {
 	//Check if hashPath has already been created and is cached.
 	hfs.mu.RLock()
@@ -507,7 +508,7 @@ func (hh *hfsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // the max-age via an optionFunc.
 func (hfs *HFS) getCacheControl() string {
 	maxAge := strconv.Itoa(int(hfs.maxAge.Seconds()))
-	return `public, max-age="` + maxAge + "`, immutable"
+	return "public, max-age=" + maxAge + ", immutable"
 }
 
 //printEmbeddedFileList used as development tool only.
