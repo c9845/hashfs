@@ -503,3 +503,68 @@ func TestMaxAge(t *testing.T) {
 		}
 	})
 }
+
+func TestHashLength(t *testing.T) {
+	t.Run("TrimToLength", func(t *testing.T) {
+		want := uint(8)
+		hfs := NewFS(fsys, HashLength(want))
+
+		originalPath := "testdata/sub.dir.2/text.txt"
+		hashPath := hfs.GetHashPath(originalPath)
+
+		rev := hfs.hashPathReverse[hashPath]
+		got := len(rev.hash)
+		if got != int(want) {
+			t.Fatalf("bad hash length; \ngot:  %d, \nwant: %d", got, want)
+			return
+		}
+
+		wantPath := "testdata/sub.dir.2/text.txt-" + rev.hash + ".txt"
+		if hashPath != wantPath {
+			t.Fatalf("bad hash length; \ngot:  %s, \nwant: %s", hashPath, wantPath)
+			return
+		}
+	})
+
+	t.Run("ZeroDontTrim", func(t *testing.T) {
+		hfs := NewFS(fsys, HashLength(0))
+
+		originalPath := "testdata/sub.dir.2/text.txt"
+		hashPath := hfs.GetHashPath(originalPath)
+
+		rev := hfs.hashPathReverse[hashPath]
+		got := len(rev.hash)
+		want := 64 //64 is length of sha256 hash, hex encoded.
+		if got != want {
+			t.Fatalf("bad hash length; \ngot:  %d, \nwant: %d", got, want)
+			return
+		}
+
+		wantPath := "testdata/sub.dir.2/text.txt-" + rev.hash + ".txt"
+		if hashPath != wantPath {
+			t.Fatalf("bad hash length; \ngot:  %s, \nwant: %s", hashPath, wantPath)
+			return
+		}
+	})
+
+	t.Run("TooBigDontTrim", func(t *testing.T) {
+		hfs := NewFS(fsys, HashLength(0))
+
+		originalPath := "testdata/sub.dir.2/text.txt"
+		hashPath := hfs.GetHashPath(originalPath)
+
+		rev := hfs.hashPathReverse[hashPath]
+		got := len(rev.hash)
+		want := 64 //64 is length of sha256 hash, hex encoded.
+		if got != want {
+			t.Fatalf("bad hash length; \ngot:  %d, \nwant: %d", got, want)
+			return
+		}
+
+		wantPath := "testdata/sub.dir.2/text.txt-" + rev.hash + ".txt"
+		if hashPath != wantPath {
+			t.Fatalf("bad hash length; \ngot:  %s, \nwant: %s", hashPath, wantPath)
+			return
+		}
+	})
+}

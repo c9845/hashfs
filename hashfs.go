@@ -93,6 +93,7 @@ type HFS struct {
 	hashLocation hashLocation
 	hashAlgo     crypto.Hash
 	maxAge       time.Duration
+	hashLength   uint
 }
 
 // reverse stores the original name and the calculated hash for a file for use in
@@ -203,7 +204,7 @@ func HashLocationFirstPeriod() optionFunc {
 }
 
 // HashAlgo specifies the algorithm to use to calculate the hash of each file's
-// contents. SHA256 is the default. MD5 is what S3 uses. This will panic if an
+// contents. Default is SHA256. MD5 is what S3 uses. This will panic if an
 // unsupported algorithm is provided.
 //
 // This should rarely be needed, since typically you don't really care about the hash
@@ -233,6 +234,23 @@ func MaxAge(d time.Duration) optionFunc {
 		}
 
 		hfs.maxAge = d
+	}
+}
+
+// HashLength trims the length of the hash added to a filename. Default is the full
+// hash length, based on the hash algorithm. Values less than 8 should not be used
+// since a collision is highly likely. If 0 is provided, the default hash length is
+// used.
+//
+// This should rarely be needed, since typically you want as long of a hash as possible
+// to alleviate collision concerns. This is helpful if you want shorter filenames.
+func HashLength(l uint) optionFunc {
+	return func(hfs *HFS) {
+		if l == 0 {
+			return
+		}
+
+		hfs.hashLength = l
 	}
 }
 
@@ -339,6 +357,12 @@ func (hfs *HFS) calculateHash(fileContents []byte) (encodedHash string) {
 	}
 
 	encodedHash = hex.EncodeToString(hash[:])
+
+	//Check if the encoded hash should be trimmed to a certain length.
+	if hfs.hashLength > 0 && int(hfs.hashLength) < len(encodedHash) {
+		encodedHash = encodedHash[:hfs.hashLength]
+	}
+
 	return
 }
 
