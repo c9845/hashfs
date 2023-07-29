@@ -26,7 +26,7 @@ import (
 	"strings"
 	"text/template"
 
-	"github.com/benbjohnson/hashfs"
+	"github.com/c9845/hashfs"
 )
 
 //go:embed website

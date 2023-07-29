@@ -1,3 +1,3 @@
-module github.com/benbjohnson/hashfs
+module github.com/c9845/hashfs
 
-go 1.16
+go 1.20
