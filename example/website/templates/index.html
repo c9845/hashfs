@@ -4,6 +4,13 @@
     </head>
     <body>
         <p id="1">Hello World! <span id="counter">0</span></p>
+
+        <p>Check your browser's devtools to inspect your static file names, now including a hash of each file's contents.</p>
+
+        <ul>
+            <li><code>/static/css/styles.css</code> -> <code>{{static "/static/css/styles.css"}}</code></li>
+            <li><code>/static/js/script.js</code> -> <code>{{static "/static/js/script.js"}}</code></li>
+        </ul>
     </body>
 
     <script src='{{static "/static/js/script.js"}}'></script>

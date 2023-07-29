@@ -1,0 +1,1 @@
+This directory provides an example implementation of hashfs. Run it with `go run example.go`.
