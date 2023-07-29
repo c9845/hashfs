@@ -15,7 +15,7 @@ import (
 //go:embed testdata
 var fsys embed.FS
 
-// Hashes for testdata files, sha256.
+// Hashes for testdata files, sha256, generated via PC terminal, not golang.
 const (
 	scriptjs     = "e959523c7cd6350c847a50ba64d1876900e1ee9dcf3b6c4abb8a6b8e6c13b262"
 	stylesmincss = "c36dd06b311aa3f26ebe91cae8607a18b4a4de23f6d1c0c40943afbf07b8278d"
